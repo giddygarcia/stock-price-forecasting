@@ -60,7 +60,7 @@ def walk_forward_validation(
         test_predictions.extend(test_preds)
         fold_starts.append(start + training_window)
 
-    results, ranked_results = score_predictions(
+    results = score_predictions(
         actuals=test_actuals,
         preds=test_predictions,
         rmse_scores=test_rmse_scores,
@@ -69,7 +69,7 @@ def walk_forward_validation(
         results=results,
     )
 
-    return results, ranked_results, test_actuals, test_predictions, fold_starts
+    return results, test_actuals, test_predictions, fold_starts
 
 
 def ma_baseline_model(train_data, testing_data, forecast_horizon, window=21):
@@ -185,18 +185,6 @@ def score_predictions(
 
     metric_cols = ["RMSE", "MAE", "MAPE", "Forecast Bias"]
 
-    if results is None or not isinstance(results, pd.DataFrame):
-        results = pd.DataFrame(
-            columns=[
-                "Ticker",
-                "Model",
-                "RMSE",
-                "MAE",
-                "MAPE",
-                "Forecast Bias",
-            ]
-        )
-
     actuals = np.array(actuals)
     preds = np.array(preds)
 
@@ -210,13 +198,14 @@ def score_predictions(
         "Forecast Bias": np.mean(actuals - preds),
     }
 
-    results = pd.concat([results, pd.DataFrame([row])], ignore_index=True)
+    new_row = pd.DataFrame([row])
+
+    if results is None or not isinstance(results, pd.DataFrame) or results.empty:
+        results = new_row
+    else:
+        results = pd.concat([results, new_row], ignore_index=True)
+
+    results = results.convert_dtypes()
     results[metric_cols] = results[metric_cols].astype(float)
 
-    ranked_results = (
-        results.sort_values(by="RMSE")
-        .reset_index(drop=True)
-        .assign(**{col: lambda df, c=col: df[c].round(4) for col in metric_cols})
-    )
-
-    return results, ranked_results
+    return results
