@@ -1,6 +1,7 @@
 import warnings
 import numpy as np
 import pandas as pd
+import yfinance as yf
 from statsmodels.tsa.arima.model import ARIMA
 from sklearn.metrics import mean_squared_error, mean_absolute_error
 from lightgbm import LGBMRegressor
@@ -246,3 +247,13 @@ def score_predictions(
     results[metric_cols] = results[metric_cols].astype(float)
 
     return results
+
+
+def get_actual_close(tickers, date="2026-03-23"):
+    date = pd.Timestamp(date)
+
+    date_str = date.strftime("%Y-%m-%d")
+    next_str = (date + pd.offsets.BDay(1)).strftime("%Y-%m-%d")
+
+    data = yf.download(tickers, start=date_str, end=next_str, progress=False)
+    return data["Close"].iloc[-1]
