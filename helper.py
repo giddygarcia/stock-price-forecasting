@@ -8,6 +8,43 @@ from statsmodels.tsa.holtwinters import SimpleExpSmoothing
 from sklearn.model_selection import RandomizedSearchCV, TimeSeriesSplit
 from lightgbm import LGBMRegressor
 from sklearn.multioutput import MultiOutputRegressor
+import scipy.stats as stats
+
+
+def sharpe_rank(df, window=252, date_range=252, confidence=0.95, time="latest"):
+    returns = df["Return"]
+
+    rolling_mean = returns.rolling(window).mean()
+    rolling_std = returns.rolling(window).std()
+    rolling_sharpe = (rolling_mean / rolling_std) * np.sqrt(date_range)
+
+    results = []
+    for ticker in returns.columns:
+        s = rolling_sharpe[ticker].dropna()
+        n = len(s)
+
+        # Report most recent rolling Sharpe ratios or overall according to time param
+        sharpe = s.iloc[-1] if time == "latest" else s.mean()
+
+        # Sharpe CI via standard error: se = sqrt((1 + 0.5*sharpe^2) / n or window)
+        se = np.sqrt((1 + 0.5 * sharpe**2) / window)
+
+        ci_low, ci_high = stats.t.interval(
+            confidence=confidence, df=n - 1, loc=sharpe, scale=se
+        )
+
+        results.append(
+            {
+                "Ticker": ticker,
+                "Sharpe": round(sharpe, 4),
+                "CI_Low": round(ci_low, 4),
+                "CI_High": round(ci_high, 4),
+            }
+        )
+
+    stat_results = pd.DataFrame(results)
+    stat_results["Rank"] = stat_results["Sharpe"].rank(ascending=False).astype(int)
+    return stat_results.sort_values("Rank").reset_index(drop=True)
 
 
 def walk_forward_validation(
