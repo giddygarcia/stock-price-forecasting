@@ -28,7 +28,10 @@ def sharpe_rank(df, window=252, date_range=252, confidence=0.95, time="latest"):
         sharpe = s.iloc[-1] if time == "latest" else s.mean()
 
         # Sharpe CI via standard error: se = sqrt((1 + 0.5*sharpe^2) / n or window)
-        se = np.sqrt((1 + 0.5 * sharpe**2) / window)
+        if time == "latest":
+            se = np.sqrt((1 + 0.5 * sharpe**2) / window)
+        else:
+            se = np.sqrt((1 + 0.5 * sharpe**2) / n)
 
         ci_low, ci_high = stats.t.interval(
             confidence=confidence, df=n - 1, loc=sharpe, scale=se
@@ -58,13 +61,15 @@ def walk_forward_validation(
     results: pd.DataFrame = None,
     series_level=None,
     invert_diff: bool = False,
-) -> tuple[pd.DataFrame, pd.DataFrame, list, list, list]:
+) -> tuple[pd.DataFrame, list, list, list, object]:
+    if series_level is not None:
+        series_level = np.array(series_level)
     test_rmse_scores = []
     test_predictions, test_actuals = [], []
     fold_starts = []
 
     for start in range(
-        0, len(series) - training_window - forecast_horizon, forecast_horizon
+        0, len(series) - training_window - forecast_horizon + 1, forecast_horizon
     ):
         train_data = series[start : start + training_window]
         testing_data = series[
@@ -98,6 +103,8 @@ def walk_forward_validation(
         test_predictions.extend(test_preds)
         fold_starts.append(start + training_window)
 
+    final_model, _ = model_fn(series, series[-forecast_horizon:], forecast_horizon)
+
     results = score_predictions(
         actuals=test_actuals,
         preds=test_predictions,
@@ -107,7 +114,7 @@ def walk_forward_validation(
         results=results,
     )
 
-    return results, test_actuals, test_predictions, fold_starts
+    return results, test_actuals, test_predictions, fold_starts, final_model
 
 
 def ma_baseline_model(train_data, testing_data, forecast_horizon, window=21):
@@ -124,18 +131,38 @@ def arima_model(train_data, testing_data, forecast_horizon):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         model = ARIMA(train_data, order=(1, 0, 1)).fit()
-    return np.array(model.fittedvalues), np.array(
-        model.forecast(steps=forecast_horizon)
-    )
+
+    preds = model.forecast(steps=forecast_horizon)
+
+    return model, np.array(preds)
+
+
+def create_more_features(window):
+    data = list(window)
+    mean = np.mean(window)
+    std = np.std(window)
+    min_ = np.min(window)
+    max_ = np.max(window)
+    roc = (window[-1] - window[0]) / (abs(window[0]) + 1e-8)
+    data += [mean, std, min_, max_, roc]
+
+    col_names = [f"lag_{i}" for i in range(len(window))] + [
+        "mean",
+        "std",
+        "min",
+        "max",
+        "roc",
+    ]
+    return pd.DataFrame([data], columns=col_names)
 
 
 best_params = {
+    "subsample": 0.8,
     "n_estimators": 100,
+    "min_child_samples": 20,
     "max_depth": 4,
     "learning_rate": 0.005,
-    "subsample": 0.8,
     "colsample_bytree": 0.6,
-    "min_child_samples": 20,
     "random_state": 42,
     "verbose": -1,
 }
@@ -143,16 +170,16 @@ best_params = {
 
 def find_best_params(tickers, df_diff, training_window=252, forecast_horizon=21):
     param_grid = {
-        "n_estimators": [100, 200, 300, 500],
-        "max_depth": [2, 3, 4, 5],
-        "learning_rate": [0.005, 0.01, 0.05, 0.1],
-        "subsample": [0.6, 0.7, 0.8, 1.0],
-        "colsample_bytree": [0.6, 0.7, 0.8, 1.0],
-        "min_child_samples": [5, 10, 20],
+        "estimator__n_estimators": [100, 200, 300, 500],
+        "estimator__max_depth": [2, 3, 4, 5],
+        "estimator__learning_rate": [0.005, 0.01, 0.05, 0.1],
+        "estimator__subsample": [0.6, 0.7, 0.8, 1.0],
+        "estimator__colsample_bytree": [0.6, 0.7, 0.8, 1.0],
+        "estimator__min_child_samples": [5, 10, 20],
     }
 
     search = RandomizedSearchCV(
-        LGBMRegressor(random_state=42, verbose=-1),
+        MultiOutputRegressor(LGBMRegressor(random_state=42, verbose=-1)),
         param_distributions=param_grid,
         n_iter=20,
         cv=TimeSeriesSplit(n_splits=3),
@@ -164,52 +191,54 @@ def find_best_params(tickers, df_diff, training_window=252, forecast_horizon=21)
     all_X, all_y = [], []
 
     for ticker in tickers:
-        series = df_diff[ticker].dropna().values[:training_window]
-        X = np.array(
+        series = df_diff[ticker]["diff"]
+        # X = last 21 values, y = next 21 values
+        X = pd.concat(
+            [
+                create_more_features(series[i - forecast_horizon : i])
+                for i in range(forecast_horizon, len(series) - forecast_horizon)
+            ],
+            ignore_index=True,
+        )
+        y = np.array(
             [
                 series[i : i + forecast_horizon]
-                for i in range(len(series) - forecast_horizon)
+                for i in range(forecast_horizon, len(series) - forecast_horizon)
             ]
         )
-        y = series[forecast_horizon:]
         all_X.append(X)
         all_y.append(y)
 
-    all_X = np.vstack(all_X)
-    all_y = np.concatenate(all_y)
+    X_df = pd.concat(all_X, ignore_index=True)
+    y_array = np.vstack(all_y)
 
-    search.fit(pd.DataFrame(all_X), all_y)
+    search.fit(X_df, y_array)
     print(f"Best params: {search.best_params_}")
-
     return search.best_params_
 
 
 def lgbm_model(train_data, testing_data, forecast_horizon, params=best_params):
     train = np.array(train_data).flatten()
 
-    X_train = np.array(
-        [
-            train[i : i + forecast_horizon]
-            for i in range(len(train) - forecast_horizon * 2)
-        ]
-    )
-    y_train = np.array(
-        [
-            train[i + forecast_horizon : i + forecast_horizon * 2]
-            for i in range(len(train) - forecast_horizon * 2)
-        ]
-    )
+    X_train = []
+    y_train = []
 
-    col_names = [f"lag_{i}" for i in range(forecast_horizon)]
-    X_train_df = pd.DataFrame(X_train, columns=col_names)
+    for i in range(forecast_horizon, len(train) - forecast_horizon):
+        window = train[i - forecast_horizon : i]
+        features = create_more_features(window)
+        X_train.append(features)
+        y_train.append(train[i : i + forecast_horizon])
+
+    X_train_df = pd.concat(X_train, ignore_index=True)
+    y_train = np.array(y_train)
 
     model = MultiOutputRegressor(LGBMRegressor(**params, n_jobs=1))
     model.fit(X_train_df, y_train)
 
-    x_input = pd.DataFrame([train[-forecast_horizon:]], columns=col_names)
+    x_input = create_more_features(train[-forecast_horizon:])
     preds = model.predict(x_input)[0]
 
-    return None, np.array(preds)
+    return model, np.array(preds)
 
 
 def score_predictions(
