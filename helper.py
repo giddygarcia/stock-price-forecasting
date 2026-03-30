@@ -30,7 +30,7 @@ def sharpe_rank(df, window=252, date_range=252, confidence=0.95, time="latest"):
     # benchmark risk-free rate = 10-year US government bond yield
     treasury = yf.download("^TNX", start=df.index[0], end=df.index[-1], progress=False)
     daily_treasury = (treasury["Close"] / 100) / 252
-    # ensure that TNX fills all data if it starts later = bfill
+    # ensure that TNX fills all data if it starts later = ffill & bfill
     risk_free_rate = daily_treasury.reindex(returns.index).ffill().bfill()
 
     rolling_mean = returns.rolling(window).mean()
@@ -125,7 +125,7 @@ def walk_forward_validation(
         ]
 
         try:
-            _, test_preds = model_fn(train_data, testing_data, forecast_horizon)
+            _, test_preds = model_fn(train_data, forecast_horizon)
         except Exception as e:
             print(f"[{model_name}] fold {start} failed: {e}")
             continue
@@ -151,7 +151,7 @@ def walk_forward_validation(
         test_predictions.extend(test_preds)
         fold_starts.append(start + training_window)
 
-    final_model, _ = model_fn(series, series[-forecast_horizon:], forecast_horizon)
+    final_model, _ = model_fn(series[:-forecast_horizon], forecast_horizon)
 
     results = score_predictions(
         actuals=test_actuals,
@@ -165,13 +165,12 @@ def walk_forward_validation(
     return results, test_actuals, test_predictions, fold_starts, final_model
 
 
-def ma_baseline_model(train_data, testing_data, forecast_horizon, window=21):
+def ma_baseline_model(train_data, forecast_horizon, window=21):
     """
     Train a baseline Moving Average modell that predicts the mean of the last 'window' / month's values.
 
     Args:
         train_data: Historical training data.
-        testing_data: Testing data
         forecast_horizon: Number of steps to forecast
         window: Number of recent observations to average (default: 21 for month)
 
@@ -183,13 +182,12 @@ def ma_baseline_model(train_data, testing_data, forecast_horizon, window=21):
     return None, forecast
 
 
-def ses_model(train_data, testing_data, forecast_horizon):
+def ses_model(train_data, forecast_horizon):
     """
     Train a Simple Exponential Smoothing model for time series forecasting
 
     Args:
         train_data: Historical training data.
-        testing_data: Testing data
         forecast_horizon: Number of steps to forecast
         window: Number of recent observations to average (default: 21 for month)
 
@@ -201,13 +199,12 @@ def ses_model(train_data, testing_data, forecast_horizon):
     return None, model.forecast(forecast_horizon)
 
 
-def arima_model(train_data, testing_data, forecast_horizon):
+def arima_model(train_data, forecast_horizon):
     """
     Train an ARIMA model on differenced data (1,0,1) for time series forecasting
 
     Args:
         train_data: Historical training data.
-        testing_data: Testing data
         forecast_horizon: Number of steps to forecast
         window: Number of recent observations to average (default: 21 for month)
 
@@ -325,13 +322,12 @@ def find_best_params(tickers, df_diff, training_window=252, forecast_horizon=21)
     return search.best_params_
 
 
-def lgbm_model(train_data, testing_data, forecast_horizon, params=best_params):
+def lgbm_model(train_data, forecast_horizon, params=best_params):
     """
     Train LGB model on differenced data for time series forecasting
 
     Args:
         train_data: Historical training data.
-        testing_data: Testing data
         forecast_horizon: Number of steps to forecast
         params: Dict of best found hyperparameters
 
@@ -385,7 +381,7 @@ def score_predictions(
         pd.DataFrame: Updated results DataFrame with new row appended.
     """
 
-    metric_cols = ["RMSE", "MAE", "MAPE", "Forecast Bias"]
+    metrics = ["RMSE", "MAE", "MAPE", "Forecast Bias"]
 
     actuals = np.array(actuals)
     preds = np.array(preds)
@@ -408,9 +404,62 @@ def score_predictions(
         results = pd.concat([results, new_row], ignore_index=True)
 
     results = results.convert_dtypes()
-    results[metric_cols] = results[metric_cols].astype(float)
+    for metric in metrics:
+        results[metric] = results[metric].round(4)
+    results[metrics] = results[metrics].astype(float)
 
     return results
+
+
+def plot_model_forecast(
+    ticker,
+    model_type,
+    ax,
+    df_close,
+    final_models,
+    forecast_df=None,
+    logo_palette=None,
+    forecast_horizon=21,
+    history_length=252,
+):
+    """
+    Plot forecast for a single ticker and model on the provided axis based on parameters.
+    """
+    # historical prices
+    history = df_close[ticker].values[-history_length:]
+    anchor = df_close[ticker].iloc[-1]
+    history_dates = df_close.index[-history_length:]
+    last_date = history_dates[-1]
+    future_dates = pd.bdate_range(start=last_date, periods=forecast_horizon + 1)[1:]
+
+    if model_type.lower() == "arima":
+        saved_model = final_models[ticker]["arima"]
+        preds = anchor + np.cumsum(saved_model.forecast(steps=forecast_horizon))
+        title = f"{ticker}: ARIMA Forecast"
+
+    elif model_type.lower() == "lgbm":
+        saved_model = final_models[ticker]["lgbm"]
+        x_input = create_more_features(forecast_df[ticker]["diff"][-forecast_horizon:])
+        preds = anchor + np.cumsum(saved_model.predict(x_input)[0])
+        title = f"{ticker}: LGBM Forecast"
+
+    else:
+        raise ValueError("model_type must be 'arima' or 'lgbm'")
+
+    ax.plot(
+        history_dates, history, color=logo_palette[ticker], linewidth=1, label="History"
+    )
+    ax.plot(
+        future_dates,
+        preds,
+        color="purple",
+        linewidth=1.5,
+        linestyle="--",
+        label="Forecast",
+    )
+    ax.axvline(x=last_date, color="gray", linestyle=":", linewidth=1)
+    ax.set_title(title)
+    ax.legend(fontsize=8)
 
 
 def get_actual_close(tickers, date="2026-03-23"):
@@ -466,4 +515,4 @@ def create_features_rank(
         f"{col}_lag{lag}" for col in target_cols for lag in range(1, lags + 1)
     ] + [f"{col}_roll{w}" for col in target_cols for w in roll_windows]
 
-    return df.dropna(subset=feature_cols)
+    return df.dropna(subset=feature_cols), feature_cols
