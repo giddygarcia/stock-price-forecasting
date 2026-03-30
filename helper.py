@@ -13,16 +13,39 @@ import scipy.stats as stats
 
 
 def sharpe_rank(df, window=252, date_range=252, confidence=0.95, time="latest"):
+    """
+    Compute rolling Sharpe ratio for multiple tickers and rank them.
+
+    Args:
+        df: Df containing "Return" column for each ticker
+        window: Rolling window size in trading days. (default: 252 / 1 trading year)
+        date_range: Annualization factor
+        confidence: Confidence interval to compute.
+        time: "latest" to use only most recent Sharpe, "mean" / else to use average over all time.
+
+    Returns:
+        stat_results: df results of Sharpe ratio stat testing.
+    """
     returns = df["Return"]
+    # benchmark risk-free rate = 10-year US government bond yield
+    treasury = yf.download("^TNX", start=df.index[0], end=df.index[-1], progress=False)
+    daily_treasury = (treasury["Close"] / 100) / 252
+    # ensure that TNX fills all data if it starts later = bfill
+    risk_free_rate = daily_treasury.reindex(returns.index).ffill().bfill()
 
     rolling_mean = returns.rolling(window).mean()
-    rolling_std = returns.rolling(window).std()
-    rolling_sharpe = (rolling_mean / rolling_std) * np.sqrt(date_range)
+    rolling_std = returns.rolling(window).std().replace(0, np.nan)
+    rolling_sharpe = ((rolling_mean - risk_free_rate.values) / rolling_std) * np.sqrt(
+        date_range
+    )
 
     results = []
     for ticker in returns.columns:
         s = rolling_sharpe[ticker].dropna()
         n = len(s)
+
+        if n == 0:
+            continue
 
         # Report most recent rolling Sharpe ratios or overall according to time param
         sharpe = s.iloc[-1] if time == "latest" else s.mean()
@@ -33,8 +56,10 @@ def sharpe_rank(df, window=252, date_range=252, confidence=0.95, time="latest"):
         else:
             se = np.sqrt((1 + 0.5 * sharpe**2) / n)
 
+        n_used = window - 1 if time == "latest" else n - 1
+
         ci_low, ci_high = stats.t.interval(
-            confidence=confidence, df=n - 1, loc=sharpe, scale=se
+            confidence=confidence, df=n_used, loc=sharpe, scale=se
         )
 
         results.append(
@@ -47,7 +72,9 @@ def sharpe_rank(df, window=252, date_range=252, confidence=0.95, time="latest"):
         )
 
     stat_results = pd.DataFrame(results)
-    stat_results["Rank"] = stat_results["Sharpe"].rank(ascending=False).astype(int)
+    stat_results["Rank"] = (
+        stat_results["Sharpe"].rank(ascending=False, method="dense").astype(int)
+    )
     return stat_results.sort_values("Rank").reset_index(drop=True)
 
 
@@ -62,6 +89,27 @@ def walk_forward_validation(
     series_level=None,
     invert_diff: bool = False,
 ) -> tuple[pd.DataFrame, list, list, list, object]:
+    """
+    Perform walk-forward validation training over a trading year to predict the next month.
+
+    Args:
+        series: Input time series (differenced values).
+        model_fn: Specify model to train and return (model, predictions).
+        ticker: Asset identifier.
+        model_name: Name of the model.
+        training_window: Number of observations per training fold.
+        forecast_horizon: Steps ahead to forecast per fold.
+        results: DataFrame results to append to.
+        series_level: Original series to use for inversion.
+        invert_diff: Whether to invert differenced predictions back to price scale.
+
+    Returns:
+        results: Updated results df.
+        test_actuals: list of true values across all folds.
+        test_predictions: list of predictions across all folds.
+        fold_starts: list of fold starting indices.
+        final_model: Trained model.
+    """
     if series_level is not None:
         series_level = np.array(series_level)
     test_rmse_scores = []
@@ -118,16 +166,55 @@ def walk_forward_validation(
 
 
 def ma_baseline_model(train_data, testing_data, forecast_horizon, window=21):
+    """
+    Train a baseline Moving Average modell that predicts the mean of the last 'window' / month's values.
+
+    Args:
+        train_data: Historical training data.
+        testing_data: Testing data
+        forecast_horizon: Number of steps to forecast
+        window: Number of recent observations to average (default: 21 for month)
+
+    Returns:
+        None: No trained model.
+        np.array: Forecasted / predicted values of length forecast_horizon
+    """
     forecast = np.full(forecast_horizon, np.mean(train_data[-window:]))
     return None, forecast
 
 
 def ses_model(train_data, testing_data, forecast_horizon):
+    """
+    Train a Simple Exponential Smoothing model for time series forecasting
+
+    Args:
+        train_data: Historical training data.
+        testing_data: Testing data
+        forecast_horizon: Number of steps to forecast
+        window: Number of recent observations to average (default: 21 for month)
+
+    Returns:
+        None: No trained model.
+        np.array: Forecasted / predicted values of length forecast_horizon
+    """
     model = SimpleExpSmoothing(train_data).fit()
     return None, model.forecast(forecast_horizon)
 
 
 def arima_model(train_data, testing_data, forecast_horizon):
+    """
+    Train an ARIMA model on differenced data (1,0,1) for time series forecasting
+
+    Args:
+        train_data: Historical training data.
+        testing_data: Testing data
+        forecast_horizon: Number of steps to forecast
+        window: Number of recent observations to average (default: 21 for month)
+
+    Returns:
+        model: Trained ARIMA model object.
+        np.array: Forecasted / predicted values of length forecast_horizon
+    """
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         model = ARIMA(train_data, order=(1, 0, 1)).fit()
@@ -138,6 +225,15 @@ def arima_model(train_data, testing_data, forecast_horizon):
 
 
 def create_more_features(window):
+    """
+    Create lag-based and statistical features from a sliding window.
+
+    Args:
+        window: Series of dates to extract features from.
+
+    Returns:
+        pd.DataFrame: Single-row df with newly created feature columns.
+    """
     data = list(window)
     mean = np.mean(window)
     std = np.std(window)
@@ -169,6 +265,18 @@ best_params = {
 
 
 def find_best_params(tickers, df_diff, training_window=252, forecast_horizon=21):
+    """
+    Perform randomized hyperparameter search for LGBM MultiOutput regressor.
+
+    Args:
+        tickers: List of asset tickers.
+        df_diff: Differenced series dictionary keyed by ticker.
+        training_window: Training window length  (Default: 252 / 1 trading year).
+        forecast_horizon: Forecast horizon (default: 21 / 1 trading month).
+
+    Returns:
+        dict: Best parameter dictionary from RandomizedSearchCV.
+    """
     param_grid = {
         "estimator__n_estimators": [100, 200, 300, 500],
         "estimator__max_depth": [2, 3, 4, 5],
@@ -218,6 +326,19 @@ def find_best_params(tickers, df_diff, training_window=252, forecast_horizon=21)
 
 
 def lgbm_model(train_data, testing_data, forecast_horizon, params=best_params):
+    """
+    Train LGB model on differenced data for time series forecasting
+
+    Args:
+        train_data: Historical training data.
+        testing_data: Testing data
+        forecast_horizon: Number of steps to forecast
+        params: Dict of best found hyperparameters
+
+    Returns:
+        model: Fitted LGB model object.
+        np.array: Forecasted / predicted values of length forecast_horizon
+    """
     train = np.array(train_data).flatten()
 
     X_train = []
@@ -249,6 +370,20 @@ def score_predictions(
     ticker: str,
     results: pd.DataFrame = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Score predictions and append to results DataFrame.
+
+    Args:
+        actuals: True values.
+        preds: Predicted values.
+        rmse_scores: RMSE for each fold/segment.
+        model_name: Model identifier.
+        ticker: Asset ticker.
+        results: Existing results DataFrame.
+
+    Returns:
+        pd.DataFrame: Updated results DataFrame with new row appended.
+    """
 
     metric_cols = ["RMSE", "MAE", "MAPE", "Forecast Bias"]
 
@@ -279,6 +414,16 @@ def score_predictions(
 
 
 def get_actual_close(tickers, date="2026-03-23"):
+    """
+    Use yfinance API to fetch actual closing prices for given tickers on a specific trading date.
+
+    Args:
+        tickers: list of asset tickers.
+        date: Date of interest. (Default: "2026-03-23" / one day forward from data)
+
+    Returns:
+        pd.Series: Closing prices of tickers on given date.
+    """
     date = pd.Timestamp(date)
 
     date_str = date.strftime("%Y-%m-%d")
@@ -286,3 +431,39 @@ def get_actual_close(tickers, date="2026-03-23"):
 
     data = yf.download(tickers, start=date_str, end=next_str, progress=False)
     return data["Close"].iloc[-1]
+
+
+def create_features_rank(
+    df, target_cols=["Return", "Volatility"], lags=5, roll_windows=[3, 5]
+):
+    """
+    Create lag and rolling features for ranking or predictive modeling.
+
+    Args:
+        df: DataFrame with columns like 'Return', 'Volatility', etc.
+        target_cols: Columns to generate features for (default: ['Return', 'Volatility']).
+        lags: Maximum lag to create (default: 5, creates lag_1 to lag_5).
+        roll_windows: List of rolling window sizes for mean features (default: [3, 5]).
+
+    Returns:
+        pd.DataFrame: DataFrame with original columns plus lag and rolling features.
+    """
+    df = df.copy()
+
+    for col in target_cols:
+        # Lag features
+        for lag in range(1, lags + 1):
+            df[f"{col}_lag{lag}"] = df.groupby("Ticker")[col].shift(lag)
+
+        # Rolling mean features (shift by 1 to avoid lookahead bias)
+        for w in roll_windows:
+            df[f"{col}_roll{w}"] = df.groupby("Ticker")[col].transform(
+                lambda x: x.shift(1).rolling(w).mean()
+            )
+
+    # Drop rows with NaNs from lag/rolling computation
+    feature_cols = [
+        f"{col}_lag{lag}" for col in target_cols for lag in range(1, lags + 1)
+    ] + [f"{col}_roll{w}" for col in target_cols for w in roll_windows]
+
+    return df.dropna(subset=feature_cols)
