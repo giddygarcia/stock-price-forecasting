@@ -10,6 +10,7 @@ from sklearn.model_selection import RandomizedSearchCV, TimeSeriesSplit
 from lightgbm import LGBMRegressor
 from sklearn.multioutput import MultiOutputRegressor
 import scipy.stats as stats
+from sklearn.metrics import ndcg_score
 
 
 def sharpe_rank(df, window=252, date_range=252, confidence=0.95, time="latest"):
@@ -498,16 +499,17 @@ def create_features_rank(
         pd.DataFrame: DataFrame with original columns plus lag and rolling features.
     """
     df = df.copy()
+    df = df.sort_values(["Ticker", "Date"]).reset_index(drop=True)
 
     for col in target_cols:
         # Lag features
         for lag in range(1, lags + 1):
-            df[f"{col}_lag{lag}"] = df.groupby("Ticker")[col].shift(lag)
+            df[f"{col}_lag{lag}"] = df.groupby("Ticker", sort=False)[col].shift(lag)
 
         # Rolling mean features (shift by 1 to avoid lookahead bias)
         for w in roll_windows:
-            df[f"{col}_roll{w}"] = df.groupby("Ticker")[col].transform(
-                lambda x: x.shift(1).rolling(w).mean()
+            df[f"{col}_roll{w}"] = df.groupby("Ticker", sort=False)[col].transform(
+                lambda x, w=w: x.shift(1).rolling(w).mean()
             )
 
     # Drop rows with NaNs from lag/rolling computation
@@ -516,3 +518,9 @@ def create_features_rank(
     ] + [f"{col}_roll{w}" for col in target_cols for w in roll_windows]
 
     return df.dropna(subset=feature_cols), feature_cols
+
+
+def compute_ndcg(group, k=5):
+    y_true = group["rank_for_model"].values.reshape(1, -1)
+    y_score = group["Score"].values.reshape(1, -1)
+    return ndcg_score(y_true, y_score, k=k)
