@@ -200,9 +200,9 @@ def ses_model(train_data, forecast_horizon):
     return None, model.forecast(forecast_horizon)
 
 
-def arima_model(train_data, forecast_horizon):
+def arima_model(train_data, forecast_horizon, set_order=(1, 0, 1)):
     """
-    Train an ARIMA model on differenced data (1,0,1) for time series forecasting
+    Train an ARIMA model on already differenced data (1,0,1) for time series forecasting
 
     Args:
         train_data: Historical training data.
@@ -215,7 +215,7 @@ def arima_model(train_data, forecast_horizon):
     """
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        model = ARIMA(train_data, order=(1, 0, 1)).fit()
+        model = ARIMA(train_data, order=set_order).fit()
 
     preds = model.forecast(steps=forecast_horizon)
 
@@ -233,10 +233,10 @@ def create_more_features(window):
         pd.DataFrame: Single-row df with newly created feature columns.
     """
     data = list(window)
-    mean = np.mean(window)
-    std = np.std(window)
-    min_ = np.min(window)
-    max_ = np.max(window)
+    mean = np.nanmean(window)
+    std = np.nanstd(window)
+    min_ = np.nanmin(window)
+    max_ = np.nanmax(window)
     roc = (window[-1] - window[0]) / (abs(window[0]) + 1e-8)
     data += [mean, std, min_, max_, roc]
 
@@ -337,6 +337,7 @@ def lgbm_model(train_data, forecast_horizon, params=best_params):
         np.array: Forecasted / predicted values of length forecast_horizon
     """
     train = np.array(train_data).flatten()
+    train = train[~np.isnan(train)]
 
     X_train = []
     y_train = []
@@ -414,51 +415,49 @@ def score_predictions(
 
 def plot_model_forecast(
     ticker,
-    model_type,
     ax,
     df_close,
     final_models,
-    forecast_df=None,
-    logo_palette=None,
+    palette=None,
     forecast_horizon=21,
     history_length=252,
+    invert_diff=False,
 ):
     """
-    Plot forecast for a single ticker and model on the provided axis based on parameters.
+    Plot ARIMA forecast for a single ticker on the provided axis.
     """
     # historical prices
     history = df_close[ticker].values[-history_length:]
     anchor = df_close[ticker].iloc[-1]
     history_dates = df_close.index[-history_length:]
     last_date = history_dates[-1]
-    future_dates = pd.bdate_range(start=last_date, periods=forecast_horizon + 1)[1:]
 
-    if model_type.lower() == "arima":
-        saved_model = final_models[ticker]["arima"]
-        preds = anchor + np.cumsum(saved_model.forecast(steps=forecast_horizon))
-        title = f"{ticker}: ARIMA Forecast"
+    saved_model = final_models[ticker]["arima"]
+    preds = saved_model.forecast(steps=forecast_horizon)
 
-    elif model_type.lower() == "lgbm":
-        saved_model = final_models[ticker]["lgbm"]
-        x_input = create_more_features(forecast_df[ticker]["diff"][-forecast_horizon:])
-        preds = anchor + np.cumsum(saved_model.predict(x_input)[0])
-        title = f"{ticker}: LGBM Forecast"
+    if invert_diff:
+        preds = anchor + np.cumsum(preds)
 
-    else:
-        raise ValueError("model_type must be 'arima' or 'lgbm'")
+    # no gap: connect forecast to history by prepending anchor
+    preds_connected = np.concatenate([[anchor], preds])
+    future_dates_connected = pd.bdate_range(
+        start=last_date, periods=forecast_horizon + 1
+    )
+
+    title = f"{ticker}: ARIMA Forecast"
 
     ax.plot(
-        history_dates, history, color=logo_palette[ticker], linewidth=1, label="History"
+        history_dates, history, color=palette[ticker], linewidth=1.5, label="History"
     )
     ax.plot(
-        future_dates,
-        preds,
-        color="purple",
-        linewidth=1.5,
+        future_dates_connected,
+        preds_connected,
+        color="deeppink",
+        linewidth=2,
         linestyle="--",
         label="Forecast",
     )
-    ax.axvline(x=last_date, color="gray", linestyle=":", linewidth=1)
+    ax.axvline(x=last_date, color="gray", linestyle=":", linewidth=1, alpha=0.5)
     ax.set_title(title)
     ax.legend(fontsize=8)
 
@@ -484,7 +483,7 @@ def get_actual_close(tickers, date="2026-03-23"):
 
 
 def create_features_rank(
-    df, target_cols=["Return", "Volatility"], lags=5, roll_windows=[3, 5]
+    df, target_cols=["Return", "Volatility", "Volume"], lags=7, roll_windows=[3, 5, 7]
 ):
     """
     Create lag and rolling features for ranking or predictive modeling.
@@ -500,6 +499,7 @@ def create_features_rank(
     """
     df = df.copy()
     df = df.sort_values(["Ticker", "Date"]).reset_index(drop=True)
+    df["Volume"] = np.log1p(df["Volume"])
 
     for col in target_cols:
         # Lag features
