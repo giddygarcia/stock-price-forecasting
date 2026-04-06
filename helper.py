@@ -521,6 +521,16 @@ def create_features_rank(
 
 
 def compute_ndcg(group, k=5):
+    """
+    Compute NDCG@5 score at rank k (5)
+
+    Args:
+        group: df containing ranking data
+        k: cutoff rank which NDCG is evaluating
+
+    Returns:
+        float: NDCG score at rank k ranging from 0 to 1 as best.
+    """
     y_true = group["rank_for_model"].values.reshape(1, -1)
     y_score = group["Score"].values.reshape(1, -1)
     return ndcg_score(y_true, y_score, k=k)

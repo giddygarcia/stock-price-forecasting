@@ -1,9 +1,11 @@
-pandas
-numpy
+pandas>=3.0
+numpy>=2.4
 yfinance
-seaborn
-matplotlib
+seaborn>=0.13
+matplotlib>=3.10
 scikit-learn
-statsmodels
+statsmodels>=0.14
 lightgbm
 lifelines
+scipy>=1.17
+jupyter
